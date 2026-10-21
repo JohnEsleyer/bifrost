@@ -67,10 +67,25 @@ Host asgard
 
 ### 2. Install the CLI
 
+**One-liner** — installs the CLI *and* writes the `~/.ssh/config` block:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JohnEsleyer/bifrost/main/install.sh \
+  | bash -s -- --ip YOUR_VPS_IP --user root
+```
+
+**Or from a clone:**
+
 ```bash
 git clone https://github.com/JohnEsleyer/bifrost.git
 cd bifrost
 ./install.sh --ip YOUR_VPS_IP --user root
+```
+
+**Or just the binary:**
+
+```bash
+sudo install -m 0755 bin/bifrost /usr/local/bin/bifrost
 ```
 
 The installer:
@@ -81,11 +96,9 @@ The installer:
 - detects your private key and warns if the permissions are too open,
 - tells you exactly what to do next.
 
-Manual install also works:
-
-```bash
-sudo install -m 0755 bin/bifrost /usr/local/bin/bifrost
-```
+> Re-running the installer is safe: it replaces its own block instead of
+> stacking duplicates. Use `./uninstall.sh` to remove both the CLI and the
+> config block.
 
 ### 3. Verify the connection
 

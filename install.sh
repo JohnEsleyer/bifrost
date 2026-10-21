@@ -17,8 +17,19 @@
 
 set -uo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_RAW="https://raw.githubusercontent.com/JohnEsleyer/bifrost/main"
+
+# Works both from a clone (./install.sh) and from a pipe
+# (curl -fsSL .../install.sh | bash -s -- --ip 1.2.3.4 --user root)
+SCRIPT_DIR="."
+if [[ -n "${BASH_SOURCE[0]:-}" && -r "${BASH_SOURCE[0]}" ]]; then
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+fi
 SRC="$SCRIPT_DIR/bin/bifrost"
+TMP_SRC=""
+
+cleanup() { [[ -n "$TMP_SRC" && -f "$TMP_SRC" ]] && rm -f "$TMP_SRC"; }
+trap cleanup EXIT
 
 HOST="${BIFROST_VPS_HOST:-asgard}"
 VPS_IP="${BIFROST_VPS_IP:-}"
@@ -73,6 +84,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Piped installs (curl ... | bash -s -- ...) have no local bin/bifrost: fetch it.
+if [[ ! -f "$SRC" ]]; then
+    command -v curl >/dev/null 2>&1 || die "curl is required for a remote install"
+    TMP_SRC="$(mktemp)"
+    say "Fetching bifrost from $REPO_RAW"
+    curl -fsSL "$REPO_RAW/bin/bifrost" -o "$TMP_SRC" \
+        || die "could not download bin/bifrost from $REPO_RAW"
+    SRC="$TMP_SRC"
+fi
 [[ -f "$SRC" ]] || die "cannot find the bifrost script at $SRC"
 
 # ------------------------------------------------------------- interactive --
