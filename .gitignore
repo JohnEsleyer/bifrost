@@ -1,0 +1,16 @@
+# Local tooling / scratch
+*.log
+*.swp
+.DS_Store
+
+# Never commit a real SSH config or key material
+id_rsa
+id_ed25519
+id_ecdsa
+*.pem
+known_hosts
+ssh/config
+
+# Local scratch dirs
+/tmp/
+.cache/

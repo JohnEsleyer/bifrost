@@ -1,0 +1,33 @@
+# =============================================================================
+#  BIFROST - SSH configuration block for your VPS ("Asgard")
+#
+#  Paste this into ~/.ssh/config (or let ./install.sh write it for you).
+#  Replace YOUR_VPS_IP and YOUR_USER before using it.
+#
+#  What each setting buys an AI agent:
+#    ControlMaster/ControlPath  one persistent socket -> ~50ms commands
+#    ControlPersist 10m         the socket survives for 10 idle minutes
+#    BatchMode yes              fail fast instead of hanging on a password prompt
+#    StrictHostKeyChecking      trust-on-first-use, but never silently rewrite
+#                               a *changed* host key (MITM protection)
+#    ServerAlive*               detect a dead peer within ~45s
+# =============================================================================
+
+Host asgard
+    HostName YOUR_VPS_IP
+    User YOUR_USER
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+
+    # Agent hardening: never ask for interactive passwords/prompts
+    BatchMode yes
+    StrictHostKeyChecking accept-new
+
+    # Instant execution (Connection Multiplexing)
+    ControlMaster auto
+    ControlPath ~/.ssh/bifrost-%r@%h:%p
+    ControlPersist 10m
+
+    # Anti-lag / keepalive
+    ServerAliveInterval 15
+    ServerAliveCountMax 3

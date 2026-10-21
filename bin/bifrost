@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  BIFROST v1.0.0 - Agent Bridge to Asgard (VPS)
+#
+#  A thin, agent-safe wrapper around OpenSSH with Connection Multiplexing
+#  (ControlMaster) always enabled.  One persistent socket in the background
+#  turns every remote command into a ~50ms round trip instead of a fresh
+#  1-2 second TCP + SSH handshake.
+#
+#  Design goals (in order):
+#    1. Never hang.  BatchMode + ConnectTimeout + ServerAlive* mean a broken
+#       link fails fast with an exit code instead of waiting for input.
+#    2. Never lose the exit code.  The remote exit status is propagated
+#       verbatim so agents can branch on `$?`.
+#    3. Never surprise.  The wrapper only *adds* sane defaults; anything
+#       already configured in ~/.ssh/config wins.
+#
+#  Install:  ./install.sh          (or copy this file to /usr/local/bin)
+#  Docs:     ../README.md
+# =============================================================================
+
+set -uo pipefail
+
+readonly BIFROST_VERSION="1.0.0"
+readonly PROG="${0##*/}"
+
+# ------------------------------------------------------------------ config --
+# Every value can be overridden from the environment (agents love env vars).
+HOST="${BIFROST_HOST:-asgard}"
+SSH_BIN="${BIFROST_SSH:-ssh}"
+SSH_DIR="${BIFROST_SSH_DIR:-$HOME/.ssh}"
+CONNECT_TIMEOUT="${BIFROST_CONNECT_TIMEOUT:-15}"
+CONTROL_PERSIST="${BIFROST_CONTROL_PERSIST:-10m}"
+SERVER_ALIVE_INTERVAL="${BIFROST_SERVER_ALIVE_INTERVAL:-15}"
+SERVER_ALIVE_COUNT_MAX="${BIFROST_SERVER_ALIVE_COUNT_MAX:-3}"
+CMD_TIMEOUT="${BIFROST_TIMEOUT:-0}"          # seconds; 0 = unlimited
+IDENTITY="${BIFROST_IDENTITY:-}"             # empty = auto-detect
+VERBOSE="${BIFROST_VERBOSE:-0}"
+
+declare -a SSH_OPTS=()
+declare -A SSH_CFG=()
+
+if [[ -t 1 ]]; then
+    C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+    C_BLU=$'\033[36m'; C_BLD=$'\033[1m';  C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_BLD=''; C_DIM=''; C_OFF=''
+fi
+
+# ----------------------------------------------------------------- helpers --
+die()  { printf '%s%s: %s%s\n' "$C_RED" "$PROG" "$1" "$C_OFF" >&2; exit "${2:-1}"; }
+note() { printf '%s%s%s\n' "$C_BLU" "$1" "$C_OFF" >&2; }
+
+usage() {
+    cat <<EOF
+${C_BLD}BIFROST${C_OFF} v${BIFROST_VERSION} - Non-Interactive Agent Gateway to a Remote VPS
+
+${C_BLD}DESCRIPTION${C_OFF}
+  Bifrost executes shell commands on the remote VPS ("Asgard") from your local
+  machine, without an interactive TTY session. stdout, stderr and the exit
+  code are forwarded verbatim, so an AI agent can read the result and branch
+  on the status without a human in the loop.
+
+  Under the hood it runs SSH with Connection Multiplexing (ControlMaster), so
+  one persistent socket in the background turns every command into a ~50ms
+  round trip instead of a fresh 1-2 second handshake.
+
+${C_BLD}USAGE${C_OFF}
+  bifrost "<command>"          Run a command on the remote host  (agent-friendly)
+  bifrost <cmd> [args...]      Same; arguments are passed straight through to ssh
+  bifrost -- <cmd> [args...]   Force remote execution, bypassing subcommands
+  bifrost --ping               Test the connection to the VPS
+  bifrost doctor               Full environment + bridge diagnostics
+  bifrost status               Show the multiplexed bridge state
+  bifrost ping [count]         Measure round-trip latency over the bridge
+  bifrost reset                Close the bridge (drop the control socket)
+  bifrost open                 Open the bridge and keep it warm
+  bifrost help | --help        This documentation
+  bifrost version              Print the version
+
+${C_BLD}AGENT OPERATING RULES${C_OFF}
+  1. QUOTE COMMANDS - always enclose the whole remote command in double
+     quotes so pipes, redirections and && reach the remote shell:
+         bifrost "docker ps -a"
+  2. STRICTLY NON-INTERACTIVE - you cannot answer prompts, so never run
+     commands that wait for input.
+         Good: bifrost "apt-get update && apt-get install -y htop"
+         Bad:  bifrost "apt-get install htop"   (hangs waiting for y/n)
+         Never: nano, vim, less, top, or any interactive prompt.
+  3. LIMIT OUTPUT - keep stdout small so it does not flood the context
+     window: use tail -n 50, head, --tail, --no-pager, --since.
+         bifrost "journalctl -u nginx -n 50 --no-pager"
+  4. EXIT CODES - the remote exit status is preserved exactly. If a command
+     fails on the VPS, bifrost returns that same non-zero status; always
+     check the status before assuming success.
+  5. RESERVED WORDS - a single-word command that collides with a subcommand
+     (status, ping, open, reset, doctor) must be escaped with --:
+         bifrost -- status
+
+${C_BLD}EXAMPLES${C_OFF}
+  bifrost "uptime"
+  bifrost "uname -a && uptime"
+  bifrost "systemctl status my-backend"
+  bifrost "docker logs backend --tail 50"
+  bifrost "cat /etc/nginx/sites-available/default"
+  bifrost "df -h && free -h"
+  bifrost "grep -R 'api_key' /srv/app --include='*.py'"
+
+${C_BLD}ENVIRONMENT${C_OFF}
+  BIFROST_HOST          Target ssh host alias (default: asgard)
+  BIFROST_TIMEOUT       Hard timeout in seconds for remote commands (0 = off)
+  BIFROST_IDENTITY     Private key to use (default: auto-detect)
+  BIFROST_CONTROL_PERSIST   ControlPersist window (default: 10m)
+  BIFROST_VERBOSE=1    Verbose ssh logging
+EOF
+}
+
+# Expand a leading ~ in a path (ssh -G reports IdentityFile as ~/.ssh/key).
+expand_tilde() {
+    local p="$1"
+    case "$p" in
+        "~")   printf '%s' "$HOME" ;;
+        "~/"*) printf '%s' "$HOME/${p#\~/}" ;;
+        *)     printf '%s' "$p" ;;
+    esac
+}
+
+# Read the *effective* ssh configuration for $HOST ("ssh -G" never connects).
+load_effective_config() {
+    SSH_CFG=()
+    local line key value
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        key="${line%% *}"
+        value="${line#* }"
+        [[ "$value" == "$line" ]] && value=""
+        SSH_CFG["$key"]="$value"
+    done < <("$SSH_BIN" -G "$HOST" 2>/dev/null)
+}
+
+# Pick a private key if the user did not configure one explicitly.
+auto_detect_identity() {
+    local candidate
+    for candidate in id_ed25519 id_rsa id_ecdsa id_dsa; do
+        if [[ -f "$SSH_DIR/$candidate" ]]; then
+            printf '%s' "$SSH_DIR/$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Mirrors OpenSSH's ControlPath ~/.ssh/bifrost-%r@%h:%p so that plain
+# `ssh asgard` and `bifrost` share the *same* control socket.
+default_control_path() {
+    local user="${SSH_CFG[user]:-$USER}"
+    local host="${SSH_CFG[hostname]:-$HOST}"
+    local port="${SSH_CFG[port]:-22}"
+    local path="$SSH_DIR/bifrost-${user}@${host}:${port}"
+
+    # Unix socket paths are limited to ~104 bytes.
+    if (( ${#path} > 92 )); then
+        local hash
+        hash="$(printf '%s' "$HOST" | md5sum | cut -c1-10)"
+        path="${TMPDIR:-/tmp}/bifrost-$(id -u)-${hash}"
+    fi
+    printf '%s' "$path"
+}
+
+# Build the -o options.  We only override settings that are still at their
+# weak OpenSSH default, so an existing ~/.ssh/config always takes priority.
+build_opts() {
+    [[ ${#SSH_CFG[@]} -eq 0 ]] && load_effective_config
+    SSH_OPTS=()
+
+    [[ "${SSH_CFG[batchmode]:-no}" == "no" ]] && SSH_OPTS+=(-o "BatchMode=yes")
+    [[ "${SSH_CFG[stricthostkeychecking]:-ask}" == "ask" ]] \
+        && SSH_OPTS+=(-o "StrictHostKeyChecking=accept-new")
+    [[ "${SSH_CFG[controlmaster]:-no}" == "no" ]] && SSH_OPTS+=(-o "ControlMaster=auto")
+    [[ "${SSH_CFG[controlpath]:-none}" == "none" ]] \
+        && SSH_OPTS+=(-o "ControlPath=$(default_control_path)")
+    [[ "${SSH_CFG[controlpersist]:-no}" == "no" ]] \
+        && SSH_OPTS+=(-o "ControlPersist=${CONTROL_PERSIST}")
+    [[ "${SSH_CFG[serveraliveinterval]:-0}" == "0" ]] \
+        && SSH_OPTS+=(-o "ServerAliveInterval=${SERVER_ALIVE_INTERVAL}")
+    [[ "${SSH_CFG[serveralivecountmax]:-3}" == "0" ]] \
+        && SSH_OPTS+=(-o "ServerAliveCountMax=${SERVER_ALIVE_COUNT_MAX}")
+    [[ "${SSH_CFG[connecttimeout]:-0}" == "0" ]] \
+        && SSH_OPTS+=(-o "ConnectTimeout=${CONNECT_TIMEOUT}")
+
+    # Key handling -----------------------------------------------------------
+    if [[ -n "$IDENTITY" ]]; then
+        SSH_OPTS+=(-o "IdentitiesOnly=yes" -i "$IDENTITY")
+    else
+        local configured=0 key
+        while IFS= read -r key; do
+            [[ -n "$key" && -f "$key" ]] && { configured=1; break; }
+        done < <(printf '%s\n' "${SSH_CFG[identityfile]:-}" | tr ' ' '\n')
+        if (( configured == 0 )); then
+            local detected
+            if detected="$(auto_detect_identity)"; then
+                SSH_OPTS+=(-o "IdentitiesOnly=yes" -i "$detected")
+            fi
+        fi
+    fi
+
+    # Noise control: "Permanently added ... to the list of known hosts." is
+    # useless noise for an agent, real errors still come through.
+    [[ "$VERBOSE" == "1" ]] || SSH_OPTS+=(-o "LogLevel=ERROR")
+    return 0
+}
+
+# The one and only remote execution path.
+exec_remote() {
+    build_opts
+    local -a cmd=("$SSH_BIN" -T "${SSH_OPTS[@]}" "$HOST" "$@")
+    if [[ "$CMD_TIMEOUT" =~ ^[0-9]+$ ]] && (( CMD_TIMEOUT > 0 )); then
+        timeout --kill-after=5s "${CMD_TIMEOUT}s" "${cmd[@]}"
+    else
+        "${cmd[@]}"
+    fi
+    return $?
+}
+
+control_socket_path() {
+    build_opts
+    local path=""
+    local opt
+    for opt in "${SSH_OPTS[@]}"; do
+        [[ "$opt" == ControlPath=* ]] && path="${opt#ControlPath=}"
+    done
+    [[ -z "$path" ]] && path="$(default_control_path)"
+    printf '%s' "$path"
+}
+
+# ------------------------------------------------------------- subcommands --
+
+cmd_status() {
+    load_effective_config
+    local path; path="$(control_socket_path)"
+
+    printf '%sBridge status%s  host=%s\n' "$C_BLD" "$C_OFF" "$HOST"
+    printf '  %-22s %s\n' "resolved hostname:" "${SSH_CFG[hostname]:-$HOST}"
+    printf '  %-22s %s\n' "port:" "${SSH_CFG[port]:-22}"
+    printf '  %-22s %s\n' "user:" "${SSH_CFG[user]:-$USER}"
+    printf '  %-22s %s\n' "control path:" "$path"
+
+    if [[ -S "$path" ]]; then
+        printf '  %-22s %spresent%s\n' "socket:" "$C_GRN" "$C_OFF"
+    else
+        printf '  %-22s %sabsent%s\n' "socket:" "$C_YEL" "$C_OFF"
+    fi
+
+    local out rc
+    out="$("$SSH_BIN" -o "ControlPath=$path" -O check "$HOST" 2>&1)"; rc=$?
+    if (( rc == 0 )); then
+        printf '  %-22s %s%s%s\n' "master:" "$C_GRN" "$out" "$C_OFF"
+    else
+        printf '  %-22s %s%s%s\n' "master:" "$C_YEL" "$out" "$C_OFF"
+        printf '\n  %sBridge is cold - the next command will pay the handshake cost.%s\n' \
+            "$C_DIM" "$C_OFF"
+    fi
+    return 0
+}
+
+cmd_ping() {
+    local count="${1:-5}"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=5
+    (( count > 50 )) && count=50
+
+    local total=0 worst=0 best=999999 i ms start end
+    printf 'Pinging %s %d time(s) over the bridge...\n' "$HOST" "$count"
+    for (( i = 1; i <= count; i++ )); do
+        start="$(date +%s%N)"
+        if exec_remote true >/dev/null 2>&1; then
+            end="$(date +%s%N)"
+            ms=$(( (end - start) / 1000000 ))
+            total=$(( total + ms ))
+            (( ms > worst )) && worst=$ms
+            (( ms < best )) && best=$ms
+            printf '  reply %2d: %s%s ms%s\n' "$i" "$C_GRN" "$ms" "$C_OFF"
+        else
+            printf '  reply %2d: %sFAILED%s\n' "$i" "$C_RED" "$C_OFF"
+            return 1
+        fi
+    done
+    printf '\n  min %s ms | avg %s ms | max %s ms\n' "$best" "$(( total / count ))" "$worst"
+    return 0
+}
+
+cmd_reset() {
+    load_effective_config
+    local path; path="$(control_socket_path)"
+    printf 'Closing the bridge to %s...\n' "$HOST"
+    "$SSH_BIN" -o "ControlPath=$path" -O exit "$HOST" 2>&1
+    local rc=$?
+    if (( rc == 0 )); then
+        printf '%sBridge closed.%s\n' "$C_GRN" "$C_OFF"
+    else
+        printf '%sNo master was running.%s\n' "$C_YEL" "$C_OFF"
+    fi
+    return 0
+}
+
+cmd_open() {
+    load_effective_config
+    build_opts
+    printf 'Opening the bridge to %s...\n' "$HOST"
+    # -N keeps the master alive with no command; ControlPersist keeps it
+    # around after this call returns.
+    "$SSH_BIN" -N -f "${SSH_OPTS[@]}" "$HOST" >/dev/null 2>&1
+    local rc=$?
+    if (( rc == 0 )); then
+        printf '%sBridge open.%s ' "$C_GRN" "$C_OFF"
+        cmd_status
+        return 0
+    fi
+    printf '%sFailed to open the bridge (ssh exit %d).%s\n' "$C_RED" "$rc" "$C_OFF" >&2
+    return "$rc"
+}
+
+doctor_ok()   { printf '  %s+%s %s\n' "$C_GRN" "$C_OFF" "$1"; }
+doctor_bad()  { printf '  %sx %s\n' "$C_RED" "$1"; DOCTOR_FAILS=$((DOCTOR_FAILS+1)); }
+doctor_soft() { printf '  %s! %s\n' "$C_YEL" "$1"; DOCTOR_WARNS=$((DOCTOR_WARNS+1)); }
+doctor_head() { printf '\n%s==> %s%s\n' "$C_BLU" "$1" "$C_OFF"; }
+
+cmd_ping_flag() {
+    printf 'Testing the Bifrost bridge to %s...\n' "$HOST"
+    if exec_remote true >/dev/null 2>&1; then
+        printf "Bridge active: %s is reachable.\n" "$HOST"
+        return 0
+    fi
+    printf 'Error: could not reach %s. Check SSH keys, the ~/.ssh/config block and the network.\n' \
+        "$HOST" >&2
+    return 1
+}
+
+cmd_doctor() {
+    load_effective_config
+
+    DOCTOR_FAILS=0
+    DOCTOR_WARNS=0
+
+    printf '%sbifrost doctor%s  v%s\n' "$C_BLD" "$C_OFF" "$BIFROST_VERSION"
+
+    doctor_head "Toolchain"
+    if command -v "$SSH_BIN" >/dev/null 2>&1; then
+        doctor_ok "ssh: $(command -v "$SSH_BIN") ($("$SSH_BIN" -V 2>&1))"
+    else
+        doctor_bad "ssh binary not found (set BIFROST_SSH to override)"
+        printf '\n%sAborting: ssh is required.%s\n' "$C_RED" "$C_OFF"
+        return 1
+    fi
+    doctor_ok "bash: ${BASH_VERSION}"
+
+    doctor_head "Target host: $HOST"
+    if [[ -f "$SSH_DIR/config" ]] && grep -qiE "^[[:space:]]*Host[[:space:]].*\b${HOST}\b" "$SSH_DIR/config"; then
+        doctor_ok "host alias '$HOST' is defined in $SSH_DIR/config"
+    else
+        doctor_soft "host alias '$HOST' is not in $SSH_DIR/config (ssh will try to resolve '$HOST' as a DNS name)"
+    fi
+    if (( ${#SSH_CFG[@]} > 0 )); then
+        doctor_ok "effective config resolved"
+        printf '      %-10s %s\n' "hostname:" "${SSH_CFG[hostname]:-$HOST}"
+        printf '      %-10s %s\n' "port:" "${SSH_CFG[port]:-22}"
+        printf '      %-10s %s\n' "user:" "${SSH_CFG[user]:-$USER}"
+        printf '      %-10s %s\n' "controlmaster:" "${SSH_CFG[controlmaster]:-no}"
+        printf '      %-10s %s\n' "controlpersist:" "${SSH_CFG[controlpersist]:-no}"
+    else
+        doctor_bad "could not resolve ssh configuration for '$HOST'"
+    fi
+
+    doctor_head "Authentication"
+    local key found=0
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        key="$(expand_tilde "$key")"
+        if [[ -f "$key" ]]; then
+            found=1
+            local mode; mode="$(stat -c '%a' "$key" 2>/dev/null || echo '?')"
+            if [[ "$mode" == "600" || "$mode" == "400" ]]; then
+                doctor_ok "private key: $key (mode $mode)"
+            else
+                doctor_soft "private key: $key (mode $mode - should be 600)"
+            fi
+            if [[ -f "$key.pub" ]]; then
+                doctor_ok "public key: $key.pub"
+            else
+                doctor_soft "no public key: $key.pub"
+            fi
+        fi
+    done < <(printf '%s\n' "${SSH_CFG[identityfile]:-}" | tr ' ' '\n')
+    (( found == 0 )) && doctor_soft "no configured private key was found on disk"
+
+    local known="${SSH_CFG[hostname]:-$HOST}"
+    if [[ -f "$SSH_DIR/known_hosts" ]] && ssh-keygen -F "$known" -f "$SSH_DIR/known_hosts" >/dev/null 2>&1; then
+        doctor_ok "known_hosts entry present for $known"
+    else
+        doctor_soft "no known_hosts entry for $known yet (will be auto-accepted on first connect)"
+    fi
+
+    doctor_head "Network"
+    local host="${SSH_CFG[hostname]:-$HOST}" port="${SSH_CFG[port]:-22}"
+    local t0 t1 ms
+    t0="$(date +%s%N)"
+    if timeout 6 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+        t1="$(date +%s%N)"; ms=$(( (t1 - t0) / 1000000 ))
+        doctor_ok "TCP $host:$port reachable (${ms} ms)"
+    else
+        doctor_soft "TCP $host:$port not reachable (host may be down, or blocked by a firewall)"
+    fi
+
+    doctor_head "Bridge (ControlMaster)"
+    local path; path="$(control_socket_path)"
+    printf '      %-18s %s\n' "control path:" "$path"
+    local out rc
+    out="$("$SSH_BIN" -o "ControlPath=$path" -O check "$HOST" 2>&1)"; rc=$?
+    if (( rc == 0 )); then
+        doctor_ok "master alive: $out"
+    else
+        doctor_soft "master not running (first command will open it)"
+    fi
+
+    doctor_head "Round trip"
+    local i start end
+    for i in 1 2 3; do
+        start="$(date +%s%N)"
+        if exec_remote true >/dev/null 2>&1; then
+            end="$(date +%s%N)"
+            printf '  %s+%s round trip %d: %s ms\n' "$C_GRN" "$C_OFF" "$i" "$(( (end - start) / 1000000 ))"
+        else
+            printf '  %sx %s round trip %d: unreachable\n' "$C_RED" "$C_OFF" "$i"
+            break
+        fi
+    done
+
+    doctor_head "Agent protocol"
+    exec_remote "exit 42" >/dev/null 2>&1
+    rc=$?
+    if (( rc == 42 )); then
+        doctor_ok "exit code passthrough works (remote 42 -> local 42)"
+    elif (( rc == 255 )); then
+        doctor_bad "ssh returned 255 - the connection itself failed (see output above)"
+    else
+        doctor_soft "exit code passthrough returned $rc instead of 42"
+    fi
+
+    printf '\n%sResult:%s %s failure(s), %s warning(s)\n' "$C_BLD" "$C_OFF" \
+        "$DOCTOR_FAILS" "$DOCTOR_WARNS"
+    (( DOCTOR_FAILS > 0 )) && return 1
+    return 0
+}
+
+# ------------------------------------------------------------------- main --
+main() {
+    case "${1:-}" in
+        help|-h|--help) usage; return 0 ;;
+        version|-v|--version) printf 'bifrost %s\n' "$BIFROST_VERSION"; return 0 ;;
+        doctor) [[ $# -eq 1 ]] || { usage; return 1; }; cmd_doctor; return $? ;;
+        status) [[ $# -eq 1 ]] || { usage; return 1; }; cmd_status; return $? ;;
+        ping) shift; cmd_ping "${1:-5}"; return $? ;;
+        --ping) cmd_ping_flag; return $? ;;
+        reset) shift; cmd_reset; return $? ;;
+        open) shift; cmd_open; return $? ;;
+        "")   # explicit empty command = "show me the docs"
+            if [[ $# -eq 0 ]]; then usage; return 1; fi
+            usage; return 0
+            ;;
+        --) shift ;;
+    esac
+
+    if [[ $# -eq 0 ]]; then
+        usage
+        return 1
+    fi
+
+    exec_remote "$@"
+    return $?
+}
+
+main "$@"
